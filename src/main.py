@@ -39,12 +39,18 @@ def main():
     主程序入口
     """
     parser = argparse.ArgumentParser(description='Forecasting Model Training')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test', 'sample'],
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test', 'sample', 'pipeline'],
                         help='运行模式')
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                         help='配置文件路径')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='检查点文件路径')
+    parser.add_argument('--input-dir', type=str, default=None,
+                        help='输入图像目录 (仅在pipeline模式下使用)')
+    parser.add_argument('--stations-csv', type=str, default=None,
+                        help='站点CSV文件路径 (仅在pipeline模式下使用)')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='输出结果目录 (仅在pipeline模式下使用)')
     
     args = parser.parse_args()
     
@@ -100,17 +106,45 @@ def main():
             x_seq = x_seq.to(config['device'])  # 确保输入在正确的设备上
             logger.log_data_shape(x_seq, "Input sequence")
             
-            # 使用混合精度进行采样（如果启用）
-            use_mixed_precision = config.get('use_mixed_precision', False)
-            if use_mixed_precision:
-                logger.info("[bold blue]Using mixed precision for sampling...[/bold blue]")
-                with torch.cuda.amp.autocast():
-                    generated = model(x_seq, mode='sample')
-            else:
-                generated = model(x_seq, mode='sample')
-                
+            # 生成预测结果
+            logger.info("[bold blue]Generating predictions...[/bold blue]")
+            generated = model.sample(x_seq, device=config['device'])
             logger.log_data_shape(generated, "Generated output")
+            
             logger.info("[bold green]Sampling completed successfully![/bold green]")
+            
+    elif args.mode == 'pipeline':
+        logger.info("[bold blue]Starting pipeline mode...[/bold blue]")
+        # 检查必要参数
+        if not args.input_dir or not args.stations_csv or not args.output_dir:
+            logger.error("[bold red]Pipeline mode requires --input-dir, --stations-csv, and --output-dir arguments[/bold red]")
+            return
+            
+        # 导入pipeline模块
+        try:
+            from pipeline import InferencePipeline
+            
+            # 创建并运行推理管线
+            pipeline = InferencePipeline(
+                config_path=args.config,
+                checkpoint_path=args.checkpoint,
+                input_dir=args.input_dir,
+                stations_csv=args.stations_csv,
+                output_dir=args.output_dir
+            )
+            
+            pipeline.run()
+            
+        except ImportError as e:
+            logger.error(f"[bold red]Failed to import pipeline module: {str(e)}[/bold red]")
+            return
+        except Exception as e:
+            logger.error(f"[bold red]Error in pipeline mode: {str(e)}[/bold red]")
+            raise
+            
+    else:
+        logger.error(f"[bold red]Unknown mode: {args.mode}[/bold red]")
+
 
 if __name__ == "__main__":
     main()

@@ -42,7 +42,7 @@ class StationLossCalculator:
     """
     站点损失计算器，用于计算基于观测站点数据的径流约束损失
     """
-    def __init__(self, stations_csv, resolution=1.0, loss_type='l1'):
+    def __init__(self, stations_csv, resolution=1.0, loss_type='l1', lat_range=(0.0, 256.0), lon_range=(0.0, 256.0)):
         """
         初始化站点损失计算器
         
@@ -50,9 +50,13 @@ class StationLossCalculator:
             stations_csv: 包含站点信息的CSV文件路径，应包含列：lat, lon, runoff
             resolution: 输出图像的地理分辨率（度），默认为1.0度
             loss_type: 损失函数类型 ('l1' 或 'mse')
+            lat_range: 纬度范围 (min, max)
+            lon_range: 经度范围 (min, max)
         """
         self.stations_df = pd.read_csv(stations_csv)
         self.resolution = resolution
+        self.lat_min, self.lat_max = lat_range
+        self.lon_min, self.lon_max = lon_range
         if loss_type == 'l1':
             self.loss_fn = nn.L1Loss()
         elif loss_type == 'mse':
@@ -60,7 +64,7 @@ class StationLossCalculator:
         else:
             raise ValueError("loss_type must be 'l1' or 'mse'")
     
-    def _get_pixel_coords(self, lat, lon, image_height, image_width, lat_min, lon_min):
+    def _get_pixel_coords(self, lat, lon, image_height, image_width):
         """
         将经纬度转换为图像像素坐标
         
@@ -69,21 +73,25 @@ class StationLossCalculator:
             lon: 经度
             image_height: 图像高度
             image_width: 图像宽度
-            lat_min: 图像最小纬度
-            lon_min: 图像最小经度
             
         Returns:
             (row, col): 像素坐标，如果超出范围则返回(None, None)
         """
-        # 计算相对于左下角的位置
-        row = int((lat - lat_min) / self.resolution)
-        col = int((lon - lon_min) / self.resolution)
-        
-        # 检查是否在图像范围内
-        if 0 <= row < image_height and 0 <= col < image_width:
-            return row, col
-        else:
+        # 检查是否在图像地理范围内
+        if not (self.lat_min <= lat <= self.lat_max and self.lon_min <= lon <= self.lon_max):
             return None, None
+
+        # 将经纬度线性映射到图像像素坐标
+        # 注意：纬度(lat)对应行(row)，经度(lon)对应列(col)
+        # 并且确保结果在 [0, size) 范围内
+        row = int((lat - self.lat_min) / (self.lat_max - self.lat_min) * image_height)
+        col = int((lon - self.lon_min) / (self.lon_max - self.lon_min) * image_width)
+
+        # 由于浮点数精度问题，可能会出现等于size的情况，需要修正
+        row = min(row, image_height - 1)
+        col = min(col, image_width - 1)
+
+        return row, col
     
     def calculate_loss(self, pred_images, target_runoff_values):
         """
@@ -100,9 +108,6 @@ class StationLossCalculator:
         total_loss = 0.0
         valid_station_count = 0
         
-        # 获取图像的地理范围（假设图像覆盖从(0,0)开始的区域）
-        lat_min, lon_min = 0.0, 0.0
-        
         # 检查target_runoff_values的维度
         if target_runoff_values.dim() == 1:
             # 如果是1维，说明是[N_stations]格式
@@ -112,7 +117,7 @@ class StationLossCalculator:
             lat, lon = station['lat'], station['lon']
             
             # 获取像素坐标
-            row, col = self._get_pixel_coords(lat, lon, height, width, lat_min, lon_min)
+            row, col = self._get_pixel_coords(lat, lon, height, width)
             
             # 如果站点在图像范围内
             if row is not None and col is not None:
@@ -161,7 +166,10 @@ class ForecastingModel(nn.Module):
                  transformer_num_layers=2,
                  diffusion_time_steps=100,
                  stations_csv=None,
-                 lambda_station=0.1):
+                 lambda_station=0.1,
+                 lat_range=(0.0, 256.0),
+                 lon_range=(0.0, 256.0),
+                 resolution=1.0):
         """
         Args:
             input_channels: 输入多通道图像的通道数
@@ -176,6 +184,9 @@ class ForecastingModel(nn.Module):
             diffusion_time_steps: 扩散过程的时间步数
             stations_csv: 站点数据CSV文件路径
             lambda_station: 站点损失权重
+            lat_range: 纬度范围 (min, max)
+            lon_range: 经度范围 (min, max)
+            resolution: 地理分辨率（度）
         """
         super(ForecastingModel, self).__init__()
         
@@ -211,7 +222,12 @@ class ForecastingModel(nn.Module):
         self.stations_csv = stations_csv
         self.lambda_station = lambda_station
         if stations_csv:
-            self.station_loss_calculator = StationLossCalculator(stations_csv, resolution=1.0)
+            self.station_loss_calculator = StationLossCalculator(
+                stations_csv, 
+                resolution=resolution,
+                lat_range=lat_range,
+                lon_range=lon_range
+            )
         else:
             self.station_loss_calculator = None
         

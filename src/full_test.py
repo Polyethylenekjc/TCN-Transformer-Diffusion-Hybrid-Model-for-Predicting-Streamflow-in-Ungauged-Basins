@@ -183,7 +183,9 @@ def train_model(model, train_loader, val_loader, config, logger):
             lambda_recon=config.get('lambda_recon', 1.0),
             lambda_station=config.get('lambda_station', 0.1),
             recon_loss_type=config.get('recon_loss_type', 'l1'),
-            station_loss_type=config.get('station_loss_type', 'l1')
+            station_loss_type=config.get('station_loss_type', 'l1'),
+            lat_range=(config.get('lat_min', 0.0), config.get('lat_max', 256.0)),
+            lon_range=(config.get('lon_min', 0.0), config.get('lon_max', 256.0))
         )
     else:
         criterion = CombinedLoss(
@@ -493,7 +495,10 @@ def main():
         transformer_num_layers=config['transformer_num_layers'],
         diffusion_time_steps=config['diffusion_time_steps'],
         stations_csv=config.get('csv_file', None),
-        lambda_station=config.get('lambda_station', 0.1)
+        lambda_station=config.get('lambda_station', 0.1),
+        lat_range=(config.get('lat_min', 0.0), config.get('lat_max', 256.0)),
+        lon_range=(config.get('lon_min', 0.0), config.get('lon_max', 256.0)),
+        resolution=config.get('resolution', 1.0)
     )
     
     model = initialize_model(model)

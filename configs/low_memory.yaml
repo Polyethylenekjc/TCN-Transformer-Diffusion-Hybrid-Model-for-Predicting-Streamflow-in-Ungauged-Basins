@@ -39,3 +39,8 @@ data:
 stations:
   csv_file: "data/stations.csv"
   resolution: 1.0
+  # 添加经纬度范围配置
+  lat_min: 0.0
+  lat_max: 256.0
+  lon_min: 0.0
+  lon_max: 256.0

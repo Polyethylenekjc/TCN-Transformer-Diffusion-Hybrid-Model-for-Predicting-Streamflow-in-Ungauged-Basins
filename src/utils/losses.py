@@ -59,7 +59,7 @@ class StationLoss(nn.Module):
     """
     基于观测站点数据的径流约束损失函数
     """
-    def __init__(self, stations_csv, resolution=1.0, loss_type='l1'):
+    def __init__(self, stations_csv, resolution=1.0, loss_type='l1', lat_range=(0.0, 256.0), lon_range=(0.0, 256.0)):
         """
         初始化站点损失函数
         
@@ -67,10 +67,14 @@ class StationLoss(nn.Module):
             stations_csv: 包含站点信息的CSV文件路径，应包含列：lat, lon, runoff
             resolution: 输出图像的地理分辨率（度），默认为1.0度
             loss_type: 损失函数类型 ('l1' 或 'mse')
+            lat_range: 纬度范围 (min, max)
+            lon_range: 经度范围 (min, max)
         """
         super(StationLoss, self).__init__()
         self.stations_df = pd.read_csv(stations_csv)
         self.resolution = resolution
+        self.lat_min, self.lat_max = lat_range
+        self.lon_min, self.lon_max = lon_range
         if loss_type == 'l1':
             self.loss_fn = nn.L1Loss(reduction='mean')
         elif loss_type == 'mse':
@@ -78,7 +82,7 @@ class StationLoss(nn.Module):
         else:
             raise ValueError("loss_type must be 'l1' or 'mse'")
     
-    def _get_pixel_coords(self, lat, lon, image_height, image_width, lat_min, lon_min):
+    def _get_pixel_coords(self, lat, lon, image_height, image_width):
         """
         将经纬度转换为图像像素坐标
         
@@ -87,15 +91,17 @@ class StationLoss(nn.Module):
             lon: 经度
             image_height: 图像高度
             image_width: 图像宽度
-            lat_min: 图像最小纬度
-            lon_min: 图像最小经度
             
         Returns:
             (row, col): 像素坐标，如果超出范围则返回(None, None)
         """
+        # 检查是否在图像地理范围内
+        if not (self.lat_min <= lat <= self.lat_max and self.lon_min <= lon <= self.lon_max):
+            return None, None
+            
         # 计算相对于左下角的位置
-        row = int((lat - lat_min) / self.resolution)
-        col = int((lon - lon_min) / self.resolution)
+        row = int((lat - self.lat_min) / self.resolution)
+        col = int((lon - self.lon_min) / self.resolution)
         
         # 检查是否在图像范围内
         if 0 <= row < image_height and 0 <= col < image_width:
@@ -119,21 +125,16 @@ class StationLoss(nn.Module):
         total_loss = 0.0
         valid_station_count = 0
         
-        # 获取图像的地理范围（假设图像覆盖从(0,0)开始的区域）
-        lat_min, lon_min = 0.0, 0.0
-        lat_max = lat_min + height * self.resolution
-        lon_max = lon_min + width * self.resolution
-        
         # 处理单个时间步的情况
         single_time_step = target_runoff_values.dim() == 1
         
         for idx, (_, station) in enumerate(self.stations_df.iterrows()):
             lat, lon = station['lat'], station['lon']
             
-            # 获取像素坐标
-            row, col = self._get_pixel_coords(lat, lon, height, width, lat_min, lon_min)
+            # 根据当前图像尺寸获取对应像素坐标
+            row, col = self._get_pixel_coords(lat, lon, height, width)
             
-            # 如果站点在图像范围内
+            # 如果站点在图像地理范围内且对应像素坐标有效
             if row is not None and col is not None:
                 # 提取预测值（在站点位置的像素值）
                 pred_value = pred_images[:, :, row, col]  # [B, 1]
@@ -159,7 +160,7 @@ class StationLoss(nn.Module):
         if valid_station_count > 0:
             return total_loss / valid_station_count
         else:
-            # 如果没有有效站点，返回0
+            # 如果没有有效站点，返回0 (确保与输入张量在同一设备上)
             return torch.tensor(0.0, device=pred_images.device)
 
 
@@ -168,7 +169,7 @@ class TotalLoss(nn.Module):
     总损失函数，结合重建损失和站点损失
     """
     def __init__(self, stations_csv, resolution=1.0, lambda_recon=1.0, lambda_station=0.1, 
-                 recon_loss_type='l1', station_loss_type='l1'):
+                 recon_loss_type='l1', station_loss_type='l1', lat_range=(0.0, 256.0), lon_range=(0.0, 256.0)):
         """
         初始化总损失函数
         
@@ -179,6 +180,8 @@ class TotalLoss(nn.Module):
             lambda_station: 站点损失权重
             recon_loss_type: 重建损失类型 ('l1', 'l2', 'ssim')
             station_loss_type: 站点损失类型 ('l1', 'mse')
+            lat_range: 纬度范围 (min, max)
+            lon_range: 经度范围 (min, max)
         """
         super(TotalLoss, self).__init__()
         self.lambda_recon = lambda_recon
@@ -193,7 +196,7 @@ class TotalLoss(nn.Module):
             raise ValueError("recon_loss_type must be 'l1', 'l2', or 'ssim'")
         
         # 初始化站点损失
-        self.station_loss = StationLoss(stations_csv, resolution, station_loss_type)
+        self.station_loss = StationLoss(stations_csv, resolution, station_loss_type, lat_range, lon_range)
         
         # 初始化扩散损失
         self.diffusion_loss = DiffusionLoss()
