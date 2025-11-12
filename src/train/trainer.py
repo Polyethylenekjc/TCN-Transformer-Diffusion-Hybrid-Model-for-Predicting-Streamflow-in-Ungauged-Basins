@@ -1,0 +1,252 @@
+import torch
+import torch.optim as optim
+import os
+
+from tqdm import tqdm
+from models.full_model import ForecastingModel, initialize_model
+from utils.losses import CombinedLoss
+from utils.metrics import calculate_all_metrics
+
+
+class Trainer:
+    """
+    模型训练器
+    """
+    def __init__(self, model, train_loader, val_loader, config):
+        """
+        Args:
+            model: 待训练的模型
+            train_loader: 训练数据加载器
+            val_loader: 验证数据加载器
+            config: 训练配置
+        """
+        self.model = initialize_model(model)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        
+        # 设置设备
+        self.device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.model.to(self.device)
+        
+        # 损失函数
+        self.criterion = CombinedLoss(
+            lambda_diff=config.get('lambda_diff', 1.0),
+            lambda_pix=config.get('lambda_pix', 0.1),
+            lambda_perc=config.get('lambda_perc', 0.01),
+            pix_loss_type=config.get('pix_loss_type', 'l1')
+        )
+        
+        # 优化器
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config.get('learning_rate', 1e-4),
+            weight_decay=config.get('weight_decay', 1e-5)
+        )
+        
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer,
+            step_size=config.get('lr_decay_step', 10),
+            gamma=config.get('lr_decay_rate', 0.9)
+        )
+        
+        # 训练状态
+        self.start_epoch = 0
+        self.best_val_loss = float('inf')
+        
+        # 检查点路径
+        self.checkpoint_dir = config.get('checkpoint_dir', './checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+    def train_epoch(self):
+        """
+        训练一个epoch
+        
+        Returns:
+            平均训练损失
+        """
+        self.model.train()
+        total_loss = 0.0
+        progress_bar = tqdm(self.train_loader, desc='Training')
+        
+        for batch_idx, (x_seq, y_gt) in enumerate(progress_bar):
+            x_seq = x_seq.to(self.device)
+            y_gt = y_gt.to(self.device)
+            
+            # 清零梯度
+            self.optimizer.zero_grad()
+            
+            # 前向传播
+            predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+            
+            # 计算损失
+            loss = self.criterion(predicted_noise, true_noise)
+            
+            # 反向传播
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # 更新参数
+            self.optimizer.step()
+            
+            # 累计损失
+            total_loss += loss.item()
+            
+            # 更新进度条
+            progress_bar.set_postfix({'Loss': loss.item()})
+            
+        return total_loss / len(self.train_loader)
+
+    def validate(self):
+        """
+        验证模型
+        
+        Returns:
+            平均验证损失和指标
+        """
+        self.model.eval()
+        total_loss = 0.0
+        total_metrics = {'mse': 0, 'rmse': 0, 'psnr': 0, 'ssim': 0}
+        
+        with torch.no_grad():
+            progress_bar = tqdm(self.val_loader, desc='Validation')
+            
+            for batch_idx, (x_seq, y_gt) in enumerate(progress_bar):
+                x_seq = x_seq.to(self.device)
+                y_gt = y_gt.to(self.device)
+                
+                # 前向传播
+                predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+                
+                # 计算损失
+                loss = self.criterion(predicted_noise, true_noise)
+                total_loss += loss.item()
+                
+                # 采样生成图像以计算指标
+                if batch_idx % 10 == 0:  # 每10个批次计算一次指标以节省时间
+                    generated = self.model(x_seq, mode='sample')
+                    batch_metrics = calculate_all_metrics(generated, y_gt)
+                    
+                    for key in total_metrics:
+                        total_metrics[key] += batch_metrics.get(key, 0)
+                
+                # 更新进度条
+                progress_bar.set_postfix({'Loss': loss.item()})
+        
+        # 计算平均值
+        avg_loss = total_loss / len(self.val_loader)
+        for key in total_metrics:
+            total_metrics[key] /= (len(self.val_loader) // 10 + 1)
+            
+        return avg_loss, total_metrics
+
+    def train(self, epochs):
+        """
+        完整训练过程
+        
+        Args:
+            epochs: 训练轮数
+        """
+        for epoch in range(self.start_epoch, epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            print("-" * 50)
+            
+            # 训练
+            train_loss = self.train_epoch()
+            
+            # 验证
+            val_loss, val_metrics = self.validate()
+            
+            # 更新学习率
+            self.scheduler.step()
+            
+            # 打印结果
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_loss:.4f}")
+            print("Val Metrics:")
+            for key, value in val_metrics.items():
+                print(f"  {key.upper()}: {value:.4f}")
+            
+            # 保存检查点
+            self.save_checkpoint(epoch, val_loss)
+            
+            # 保存最佳模型
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint(epoch, val_loss, is_best=True)
+
+    def save_checkpoint(self, epoch, val_loss, is_best=False):
+        """
+        保存检查点
+        
+        Args:
+            epoch: 当前epoch
+            val_loss: 验证损失
+            is_best: 是否是最佳模型
+        """
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'val_loss': val_loss,
+            'config': self.config
+        }
+        
+        # 保存定期检查点
+        checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
+        torch.save(checkpoint, checkpoint_path)
+        
+        # 保存最佳模型
+        if is_best:
+            best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
+            torch.save(checkpoint, best_path)
+            print(f"New best model saved with validation loss: {val_loss:.4f}")
+
+    def load_checkpoint(self, checkpoint_path):
+        """
+        加载检查点
+        
+        Args:
+            checkpoint_path: 检查点路径
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_val_loss = checkpoint['val_loss']
+        print(f"Checkpoint loaded. Resume training from epoch {self.start_epoch}")
+
+
+def create_trainer(config):
+    """
+    创建训练器实例
+    
+    Args:
+        config: 训练配置
+        
+    Returns:
+        Trainer实例
+    """
+    # 创建模型
+    model = ForecastingModel(
+        input_channels=config.get('input_channels', 3),
+        d_model=config.get('d_model', 128),
+        tcn_dilations=config.get('tcn_dilations', [1, 2, 4, 8]),
+        transformer_num_heads=config.get('transformer_num_heads', 8),
+        transformer_num_layers=config.get('transformer_num_layers', 4),
+        diffusion_time_steps=config.get('diffusion_time_steps', 1000)
+    )
+    
+    # 这里应该传入实际的data_loader，此处仅为示例
+    # train_loader = ...
+    # val_loader = ...
+    
+    # trainer = Trainer(model, train_loader, val_loader, config)
+    # return trainer
+    
+    return model  # 简化返回模型本身

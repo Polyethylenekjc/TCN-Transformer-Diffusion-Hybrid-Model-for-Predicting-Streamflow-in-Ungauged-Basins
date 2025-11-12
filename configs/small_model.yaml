@@ -1,0 +1,29 @@
+# 小型模型配置示例
+model:
+  input_channels: 3
+  d_model: 32
+  tcn_dilations: [1, 2, 4]
+  transformer_num_heads: 4
+  transformer_num_layers: 2
+  diffusion_time_steps: 1000
+
+# 训练配置
+training:
+  learning_rate: 0.0001
+  batch_size: 16
+  epochs: 30
+  lambda_diff: 1.0
+  lambda_pix: 0.1
+  lambda_perc: 0.01
+
+# 硬件配置
+hardware:
+  device: "cuda" # 如果没有GPU则使用"cpu"
+
+# 数据配置
+data:
+  sequence_length: 15
+  input_height: 32
+  input_width: 32
+  output_height: 128
+  output_width: 128
