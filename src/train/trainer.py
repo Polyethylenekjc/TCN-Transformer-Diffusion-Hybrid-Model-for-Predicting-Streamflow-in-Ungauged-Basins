@@ -35,6 +35,17 @@ class Trainer:
         # 记录设备信息
         self.logger.info(f"Using device: {self.device}")
         
+        # 混合精度训练设置
+        self.use_mixed_precision = config.get('use_mixed_precision', False)
+        if self.use_mixed_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
+            self.logger.info("Mixed precision training enabled")
+        
+        # 梯度累积设置
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        if self.gradient_accumulation_steps > 1:
+            self.logger.info(f"Gradient accumulation enabled with {self.gradient_accumulation_steps} steps")
+        
         # 损失函数
         self.criterion = CombinedLoss(
             lambda_diff=config.get('lambda_diff', 1.0),
@@ -95,33 +106,46 @@ class Trainer:
                     self.logger.log_data_shape(y_gt, "Ground truth (y_gt)")
                 
                 # 清零梯度
-                self.optimizer.zero_grad()
+                if batch_idx % self.gradient_accumulation_steps == 0:
+                    self.optimizer.zero_grad()
                 
-                # 前向传播
-                predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
-                
-                # 记录输出数据形状（仅在前几个批次记录）
-                if batch_idx == 0:
-                    self.logger.log_data_shape(predicted_noise, "Predicted noise")
-                    self.logger.log_data_shape(true_noise, "True noise")
-                
-                # 计算损失
-                loss = self.criterion(predicted_noise, true_noise)
+                # 前向传播和损失计算（使用混合精度）
+                if self.use_mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+                        loss = self.criterion(predicted_noise, true_noise)
+                        # 梯度累积时需要对损失进行缩放
+                        if self.gradient_accumulation_steps > 1:
+                            loss = loss / self.gradient_accumulation_steps
+                else:
+                    predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+                    loss = self.criterion(predicted_noise, true_noise)
+                    # 梯度累积时需要对损失进行缩放
+                    if self.gradient_accumulation_steps > 1:
+                        loss = loss / self.gradient_accumulation_steps
                 
                 # 反向传播
-                loss.backward()
+                if self.use_mixed_precision:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 
                 # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # 更新参数
-                self.optimizer.step()
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # 更新参数
+                    if self.use_mixed_precision:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
                 
                 # 累计损失
-                total_loss += loss.item()
+                total_loss += loss.item() * self.gradient_accumulation_steps  # 恢复原始损失值
                 
                 # 更新进度条
-                progress.update(task, advance=1, description=f"[cyan]Training Epoch {epoch+1}[/cyan] - Loss: {loss.item():.4f}")
+                progress.update(task, advance=1, description=f"[cyan]Training Epoch {epoch+1}[/cyan] - Loss: {loss.item() * self.gradient_accumulation_steps:.4f}")
                 
         avg_loss = total_loss / len(self.train_loader)
         self.logger.info(f"[green]Epoch {epoch+1} - Training completed.[/green] Average loss: [bold]{avg_loss:.4f}[/bold]")
@@ -146,16 +170,26 @@ class Trainer:
                     x_seq = x_seq.to(self.device)
                     y_gt = y_gt.to(self.device)
                     
-                    # 前向传播
-                    predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
-                    
-                    # 计算损失
-                    loss = self.criterion(predicted_noise, true_noise)
+                    # 混合精度验证
+                    if self.use_mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+                            loss = self.criterion(predicted_noise, true_noise)
+                    else:
+                        predicted_noise, true_noise = self.model(x_seq, y_gt, mode='train')
+                        loss = self.criterion(predicted_noise, true_noise)
+                        
                     total_loss += loss.item()
                     
                     # 采样生成图像以计算指标
                     if batch_idx % 10 == 0:  # 每10个批次计算一次指标以节省时间
-                        generated = self.model(x_seq, mode='sample')
+                        # 混合精度采样
+                        if self.use_mixed_precision:
+                            with torch.cuda.amp.autocast():
+                                generated = self.model(x_seq, mode='sample')
+                        else:
+                            generated = self.model(x_seq, mode='sample')
+                            
                         batch_metrics = calculate_all_metrics(generated, y_gt)
                         
                         for key in total_metrics:
@@ -277,7 +311,7 @@ def create_trainer(config):
         tcn_dilations=config.get('tcn_dilations', [1, 2, 4, 8]),
         transformer_num_heads=config.get('transformer_num_heads', 8),
         transformer_num_layers=config.get('transformer_num_layers', 4),
-        diffusion_time_steps=config.get('diffusion_time_steps', 1000)
+        diffusion_time_steps=config.get('diffusion_time_steps', 100)
     )
     
     # 这里应该传入实际的data_loader，此处仅为示例

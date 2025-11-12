@@ -1,20 +1,25 @@
-# 小型模型配置示例
+# 小模型配置 - 用于快速验证模型结构
 model:
-  input_channels: 3
+  input_channels: 5
   d_model: 32
   tcn_dilations: [1, 2, 4]
   transformer_num_heads: 4
   transformer_num_layers: 2
-  diffusion_time_steps: 1000
+  diffusion_time_steps: 200
 
 # 训练配置
 training:
   learning_rate: 0.0001
-  batch_size: 16
-  epochs: 30
+  batch_size: 4
+  epochs: 50
   lambda_diff: 1.0
   lambda_pix: 0.1
   lambda_perc: 0.01
+  lambda_recon: 1.0
+  lambda_station: 0.1
+  use_mixed_precision: True
+  gradient_accumulation_steps: 2
+  use_station_loss: True
 
 # 硬件配置
 hardware:
@@ -22,8 +27,15 @@ hardware:
 
 # 数据配置
 data:
-  sequence_length: 15
-  input_height: 32
-  input_width: 32
-  output_height: 128
-  output_width: 128
+  sequence_length: 10
+  input_channels: 5
+  input_height: 128
+  input_width: 128
+  output_height: 256
+  output_width: 256
+  resolution: 1.0
+
+# 站点配置
+stations:
+  csv_file: "data/stations.csv"
+  resolution: 1.0

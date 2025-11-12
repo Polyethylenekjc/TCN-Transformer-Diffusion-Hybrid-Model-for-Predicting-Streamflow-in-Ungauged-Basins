@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import pandas as pd
 from .spatial_encoder import SpatialEncoder
 from .temporal_encoder import TemporalTCN
 from .transformer_encoder import TransformerEncoder
@@ -37,6 +38,112 @@ def initialize_model(model):
     return model
 
 
+class StationLossCalculator:
+    """
+    站点损失计算器，用于计算基于观测站点数据的径流约束损失
+    """
+    def __init__(self, stations_csv, resolution=1.0, loss_type='l1'):
+        """
+        初始化站点损失计算器
+        
+        Args:
+            stations_csv: 包含站点信息的CSV文件路径，应包含列：lat, lon, runoff
+            resolution: 输出图像的地理分辨率（度），默认为1.0度
+            loss_type: 损失函数类型 ('l1' 或 'mse')
+        """
+        self.stations_df = pd.read_csv(stations_csv)
+        self.resolution = resolution
+        if loss_type == 'l1':
+            self.loss_fn = nn.L1Loss()
+        elif loss_type == 'mse':
+            self.loss_fn = nn.MSELoss()
+        else:
+            raise ValueError("loss_type must be 'l1' or 'mse'")
+    
+    def _get_pixel_coords(self, lat, lon, image_height, image_width, lat_min, lon_min):
+        """
+        将经纬度转换为图像像素坐标
+        
+        Args:
+            lat: 纬度
+            lon: 经度
+            image_height: 图像高度
+            image_width: 图像宽度
+            lat_min: 图像最小纬度
+            lon_min: 图像最小经度
+            
+        Returns:
+            (row, col): 像素坐标，如果超出范围则返回(None, None)
+        """
+        # 计算相对于左下角的位置
+        row = int((lat - lat_min) / self.resolution)
+        col = int((lon - lon_min) / self.resolution)
+        
+        # 检查是否在图像范围内
+        if 0 <= row < image_height and 0 <= col < image_width:
+            return row, col
+        else:
+            return None, None
+    
+    def calculate_loss(self, pred_images, target_runoff_values):
+        """
+        计算站点损失
+        
+        Args:
+            pred_images: 预测图像 [B, 1, H, W]
+            target_runoff_values: 目标径流值 [N_stations] 或 [N_stations, B]
+            
+        Returns:
+            站点损失值
+        """
+        batch_size, _, height, width = pred_images.shape
+        total_loss = 0.0
+        valid_station_count = 0
+        
+        # 获取图像的地理范围（假设图像覆盖从(0,0)开始的区域）
+        lat_min, lon_min = 0.0, 0.0
+        
+        # 检查target_runoff_values的维度
+        if target_runoff_values.dim() == 1:
+            # 如果是1维，说明是[N_stations]格式
+            target_runoff_values = target_runoff_values.unsqueeze(1)  # 变为[N_stations, 1]
+        
+        for idx, (_, station) in enumerate(self.stations_df.iterrows()):
+            lat, lon = station['lat'], station['lon']
+            
+            # 获取像素坐标
+            row, col = self._get_pixel_coords(lat, lon, height, width, lat_min, lon_min)
+            
+            # 如果站点在图像范围内
+            if row is not None and col is not None:
+                # 提取预测值（在站点位置的像素值）
+                pred_value = pred_images[:, :, row, col]  # [B, 1]
+                
+                # 获取目标值，确保索引不会越界
+                if target_runoff_values.shape[0] <= idx:
+                    # 如果索引超出范围，跳过该站点
+                    continue
+                    
+                if target_runoff_values.shape[1] == 1:
+                    # 如果目标值只有一列，则扩展到batch_size
+                    target_values = target_runoff_values[idx].unsqueeze(0).expand(batch_size, 1)  # [B, 1]
+                else:
+                    # 如果目标值有多列，则直接取对应的batch_size个值，但要确保不会索引越界
+                    target_values = target_runoff_values[idx, :batch_size].unsqueeze(1)  # [B, 1]
+                
+                # 计算损失
+                station_loss = self.loss_fn(pred_value, target_values)
+                total_loss += station_loss
+                valid_station_count += 1
+        
+        # 返回平均损失
+        if valid_station_count > 0:
+            return total_loss / valid_station_count
+        else:
+            # 如果没有有效站点，返回0
+            return torch.tensor(0.0, device=pred_images.device)
+
+
 class ForecastingModel(nn.Module):
     """
     完整的预测模型，整合所有组件：
@@ -52,7 +159,9 @@ class ForecastingModel(nn.Module):
                  tcn_dilations=[1, 2],
                  transformer_num_heads=4,
                  transformer_num_layers=2,
-                 diffusion_time_steps=1000):
+                 diffusion_time_steps=100,
+                 stations_csv=None,
+                 lambda_station=0.1):
         """
         Args:
             input_channels: 输入多通道图像的通道数
@@ -65,6 +174,8 @@ class ForecastingModel(nn.Module):
             transformer_num_heads: Transformer注意力头数
             transformer_num_layers: Transformer层数
             diffusion_time_steps: 扩散过程的时间步数
+            stations_csv: 站点数据CSV文件路径
+            lambda_station: 站点损失权重
         """
         super(ForecastingModel, self).__init__()
         
@@ -77,21 +188,32 @@ class ForecastingModel(nn.Module):
         # 组件初始化
         self.spatial_encoder = SpatialEncoder(input_channels, d_model=d_model, downsample_steps=2)
         self.temporal_encoder = TemporalTCN(d_model, dilations=tcn_dilations)
+        # 使用temporal_encoder的实际输出维度来初始化transformer_encoder
+        transformer_d_model = self.temporal_encoder.output_dim
         self.transformer_encoder = TransformerEncoder(
-            d_model=d_model, 
+            d_model=transformer_d_model, 
             num_heads=transformer_num_heads, 
             num_layers=transformer_num_layers,
-            hidden_dim=2*d_model,
+            hidden_dim=2*transformer_d_model,
             max_seq_length=256
         )
         self.diffusion_decoder = ConditionalUNet(
             in_channels=1, 
             out_channels=1, 
-            d_model=d_model
+            d_model=transformer_d_model  # 使用transformer的实际输出维度
         )
         
         self.d_model = d_model
+        self.transformer_d_model = transformer_d_model
         self.diffusion_time_steps = diffusion_time_steps
+        
+        # 站点损失相关
+        self.stations_csv = stations_csv
+        self.lambda_station = lambda_station
+        if stations_csv:
+            self.station_loss_calculator = StationLossCalculator(stations_csv, resolution=1.0)
+        else:
+            self.station_loss_calculator = None
         
         # 预计算扩散系数
         self._precompute_coefficients()
@@ -110,14 +232,14 @@ class ForecastingModel(nn.Module):
         spatial_features = self.spatial_encoder(x_seq)  # (B, T, d_model, H', W')
         
         # 时序编码
-        temporal_features = self.temporal_encoder(spatial_features)  # (B, d_model, H', W')
+        temporal_features = self.temporal_encoder(spatial_features)  # (B, temporal_d_model, H', W')
         
         # Transformer全局上下文建模
-        cond_features = self.transformer_encoder(temporal_features)  # (B, d_model, H', W')
+        cond_features = self.transformer_encoder(temporal_features)  # (B, temporal_d_model, H', W')
         
         return cond_features
     
-    def forward_diffusion(self, x_seq, y_gt, timestep=None):
+    def forward_diffusion(self, x_seq, y_gt, timestep=None, target_runoff_values=None):
         """
         扩散训练前向过程
         
@@ -125,15 +247,21 @@ class ForecastingModel(nn.Module):
             x_seq: 输入序列，形状为 (B, T, C, H_in, W_in)
             y_gt: 真实标签，形状为 (B, 1, H_out, W_out)
             timestep: 时间步，如果为None则随机采样
+            target_runoff_values: 目标径流值 [N_stations]，如果提供则计算站点损失
             
         Returns:
-            预测噪声和真实噪声
+            预测噪声和真实噪声，如果提供target_runoff_values还会返回站点损失
         """
         # 获取条件编码
-        cond = self.forward_frame_prediction(x_seq)  # (B, d_model, H', W')
+        cond = self.forward_frame_prediction(x_seq)  # (B, transformer_d_model, H', W')
         
         # 确保y_gt在正确的设备上
         y_gt = y_gt.to(cond.device)
+        
+        # 在加噪前计算站点损失（避免OOM问题）
+        station_loss = None
+        if target_runoff_values is not None and self.station_loss_calculator is not None:
+            station_loss = self.station_loss_calculator.calculate_loss(y_gt, target_runoff_values)
         
         # 随机采样时间步
         if timestep is None:
@@ -150,21 +278,25 @@ class ForecastingModel(nn.Module):
         # 预测噪声
         predicted_noise = self.diffusion_decoder(noisy_image, timestep, cond)
         
-        return predicted_noise, noise
+        if station_loss is not None:
+            return predicted_noise, noise, station_loss
+        else:
+            return predicted_noise, noise
 
-    def sample(self, x_seq, num_steps=50):
+    def sample(self, x_seq, target_runoff_values=None):
         """
         从噪声中采样生成最终图像
         
         Args:
             x_seq: 输入序列，形状为 (B, T, C, H_in, W_in)
-            num_steps: 采样步数
+            target_runoff_values: 目标径流值 [N_stations]，如果提供则计算站点损失
             
         Returns:
             生成的图像，形状为 (B, 1, H_out, W_out)
+            如果提供target_runoff_values，还会返回站点损失
         """
         # 获取条件编码
-        cond = self.forward_frame_prediction(x_seq)  # (B, d_model, H', W')
+        cond = self.forward_frame_prediction(x_seq)  # (B, transformer_d_model, H', W')
         
         # 初始化
         batch_size = x_seq.shape[0]
@@ -173,9 +305,7 @@ class ForecastingModel(nn.Module):
         x = torch.randn(image_shape, device=cond.device)
         
         # 逐步去噪
-        for t in reversed(range(0, num_steps)):
-
-            
+        for t in reversed(range(0, 50)):  # 默认使用50步采样
             # 计算当前时间步
             timestep = torch.full((batch_size,), t, device=cond.device, dtype=torch.long)
             
@@ -189,7 +319,77 @@ class ForecastingModel(nn.Module):
         if x.shape[2] != self.output_height or x.shape[3] != self.output_width:
             x = F.interpolate(x, size=(self.output_height, self.output_width), mode='bilinear', align_corners=True)
             
+        # 如果提供了目标径流值，则计算站点损失
+        if target_runoff_values is not None and self.station_loss_calculator is not None:
+            station_loss = self.station_loss_calculator.calculate_loss(x, target_runoff_values)
+            return x, station_loss
+            
         return x
+
+    def sample_with_station_loss(self, x_seq, target_runoff_values=None):
+        """
+        从噪声中采样生成最终图像，并可选择计算站点损失（优化内存使用）
+        
+        Args:
+            x_seq: 输入序列，形状为 (B, T, C, H_in, W_in)
+            target_runoff_values: 目标径流值 [N_stations]，如果提供则计算站点损失
+            
+        Returns:
+            生成的图像，形状为 (B, 1, H_out, W_out)
+            如果提供target_runoff_values，还会返回站点损失
+        """
+        # 获取条件编码
+        cond = self.forward_frame_prediction(x_seq)  # (B, transformer_d_model, H', W')
+        
+        # 初始化
+        batch_size = x_seq.shape[0]
+        # 使用配置的输出尺寸
+        image_shape = (batch_size, 1, self.output_height, self.output_width)
+        x = torch.randn(image_shape, device=cond.device)
+        
+        # 逐步去噪
+        for t in reversed(range(0, 50)):  # 默认使用50步采样
+            # 计算当前时间步
+            timestep = torch.full((batch_size,), t, device=cond.device, dtype=torch.long)
+            
+            # 预测噪声
+            predicted_noise = self.diffusion_decoder(x, timestep, cond)
+            
+            # 更新图像
+            x = self._denoise_step(x, predicted_noise, timestep, image_shape)
+            
+        # 确保输出尺寸正确
+        if x.shape[2] != self.output_height or x.shape[3] != self.output_width:
+            x = F.interpolate(x, size=(self.output_height, self.output_width), mode='bilinear', align_corners=True)
+            
+        # 如果提供了目标径流值，则计算站点损失
+        if target_runoff_values is not None and self.station_loss_calculator is not None:
+            # 使用torch.no_grad()上下文管理器，避免保留计算图
+            with torch.no_grad():
+                station_loss = self.station_loss_calculator.calculate_loss(x, target_runoff_values)
+            return x, station_loss
+            
+        return x
+
+    def compute_station_loss_only(self, x_seq, generated_image, target_runoff_values):
+        """
+        仅计算站点损失，不保留完整计算图以减少内存消耗
+        
+        Args:
+            x_seq: 输入序列，形状为 (B, T, C, H_in, W_in)
+            generated_image: 生成的图像，形状为 (B, 1, H_out, W_out)
+            target_runoff_values: 目标径流值 [N_stations]
+            
+        Returns:
+            站点损失值
+        """
+        if self.station_loss_calculator is not None:
+            # 使用torch.no_grad()上下文管理器，避免保留计算图
+            with torch.no_grad():
+                station_loss = self.station_loss_calculator.calculate_loss(generated_image, target_runoff_values)
+            return station_loss
+        else:
+            return torch.tensor(0.0, device=generated_image.device)
 
     def _denoise_step(self, x, predicted_noise, timestep, target_shape):
         """
@@ -248,22 +448,27 @@ class ForecastingModel(nn.Module):
         self.register_buffer('_sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         self.register_buffer('_sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
 
-    def forward(self, x_seq, y_gt=None, mode='train'):
+    def forward(self, x_seq, y_gt=None, mode='train', target_runoff_values=None):
         """
-        前向传播主接口
+        前向传播
         
         Args:
             x_seq: 输入序列，形状为 (B, T, C, H_in, W_in)
-            y_gt: 真实标签，在训练模式下必需
-            mode: 运行模式 ('train', 'eval', 'sample')
+            y_gt: 真实标签，形状为 (B, 1, H_out, W_out)
+            mode: 运行模式 ('train' 或 'sample')
+            target_runoff_values: 目标径流值 [N_stations]，如果提供则计算站点损失
             
         Returns:
-            根据模式返回不同的结果
+            训练模式: (predicted_noise, true_noise) 或 (predicted_noise, true_noise, station_loss)
+            采样模式: 生成的图像 (B, 1, H_out, W_out)
         """
         if mode == 'train':
-            assert y_gt is not None, "Ground truth is required in training mode"
-            return self.forward_diffusion(x_seq, y_gt)
+            assert y_gt is not None, "y_gt must be provided in train mode"
+            return self.forward_diffusion(x_seq, y_gt, target_runoff_values=target_runoff_values)
         elif mode == 'sample':
-            return self.sample(x_seq)
+            if target_runoff_values is not None:
+                return self.sample_with_station_loss(x_seq, target_runoff_values)
+            else:
+                return self.sample(x_seq)
         else:
-            return self.forward_frame_prediction(x_seq)
+            raise ValueError(f"Unknown mode: {mode}")

@@ -31,6 +31,8 @@ class MultiHeadAttention(nn.Module):
         
     def forward(self, x, mask=None):
         batch_size, seq_length, d_model = x.size()
+        # 确保输入维度与d_model一致
+        assert d_model == self.d_model, f"Input feature dimension {d_model} doesn't match expected dimension {self.d_model}"
         
         Q = self.W_q(x).view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)
         K = self.W_k(x).view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)
@@ -130,6 +132,9 @@ class TransformerEncoder(nn.Module):
             编码后的特征，形状为 (B, d_model, H, W)
         """
         B, d_model, H, W = x.shape
+        # 确保输入维度与期望的d_model一致
+        assert d_model == self.d_model, f"Input feature dimension {d_model} doesn't match expected dimension {self.d_model}"
+        
         # 将空间位置作为tokens
         x = x.view(B, d_model, H*W).permute(0, 2, 1)  # (B, H*W, d_model)
         

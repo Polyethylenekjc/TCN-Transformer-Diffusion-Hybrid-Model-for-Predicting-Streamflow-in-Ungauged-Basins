@@ -100,13 +100,17 @@ def main():
             x_seq = x_seq.to(config['device'])  # 确保输入在正确的设备上
             logger.log_data_shape(x_seq, "Input sequence")
             
-            # 采样生成
-            logger.info("[bold blue]Starting model sampling...[/bold blue]")
-            generated = model(x_seq, mode='sample')
-            logger.log_data_shape(generated, "Generated image")
-            
-    logger.info("[bold green]Process completed.[/bold green]")
-
+            # 使用混合精度进行采样（如果启用）
+            use_mixed_precision = config.get('use_mixed_precision', False)
+            if use_mixed_precision:
+                logger.info("[bold blue]Using mixed precision for sampling...[/bold blue]")
+                with torch.cuda.amp.autocast():
+                    generated = model(x_seq, mode='sample')
+            else:
+                generated = model(x_seq, mode='sample')
+                
+            logger.log_data_shape(generated, "Generated output")
+            logger.info("[bold green]Sampling completed successfully![/bold green]")
 
 if __name__ == "__main__":
     main()
