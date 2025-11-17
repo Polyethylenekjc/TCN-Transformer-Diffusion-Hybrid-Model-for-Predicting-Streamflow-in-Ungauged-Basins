@@ -185,7 +185,7 @@ class StreamflowDataset(Dataset):
         lon_min, lon_max, lat_min, lat_max = self.region
         
         px = int((lon - lon_min) / self.resolution)
-        py = int((lat_min - lat) / self.resolution)  # Note: lat inverted
+        py = int((lat_max - lat) / self.resolution)
         
         # Clamp to image bounds using configured size
         px = max(0, min(px, self.input_width - 1))

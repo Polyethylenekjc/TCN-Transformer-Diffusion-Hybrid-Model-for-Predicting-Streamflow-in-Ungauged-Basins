@@ -37,8 +37,8 @@ def generate_dummy_data(
     days: int = 30,
     stations: int = 5,
     channels: int = 10,
-    height: int = 128,
-    width: int = 128,
+    height: int = 400,
+    width: int = 600,
     num_blobs: int = 4,
     blob_sigma_range: tuple = (5, 20),
     blob_speed_range: tuple = (0.5, 3),
@@ -79,8 +79,8 @@ def generate_dummy_data(
             'station_dir': str(station_dir),
             'output_dir': str(output_path / 'output'),
             'image_size': [height, width],
-            'resolution': 0.05,
-            'region': [100, 110, 25, 35],
+            'resolution': 0.1,
+            'region': [90, 150, -15, 25],
             'window_size': 5,
             'upscale_factor': 2,
             'normalize': True
@@ -136,7 +136,7 @@ def generate_dummy_data(
     station_pixels = []
     for lon, lat in zip(station_lons, station_lats):
         px = int((lon - lon_min) / resolution)
-        py = int((lat_min - lat) / resolution)
+        py = int((lat_max - lat) / resolution)
         px = max(0, min(px, width - 1))
         py = max(0, min(py, height - 1))
         station_pixels.append((px, py))
