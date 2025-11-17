@@ -181,16 +181,26 @@ class StreamflowDataset(Dataset):
         return np.array(date_positions, dtype=np.int32), np.array(date_runoffs)
     
     def _lonlat_to_pixel(self, lon: float, lat: float) -> Tuple[int, int]:
-        """Convert lon/lat to pixel position."""
+        """Convert lon/lat to pixel position using proportional mapping.
+        This keeps mapping correct even when image_size != (region span / resolution).
+        """
         lon_min, lon_max, lat_min, lat_max = self.region
-        
-        px = int((lon - lon_min) / self.resolution)
-        py = int((lat_max - lat) / self.resolution)
-        
-        # Clamp to image bounds using configured size
+
+        # Avoid division by zero
+        lon_span = max(1e-9, (lon_max - lon_min))
+        lat_span = max(1e-9, (lat_max - lat_min))
+
+        # Proportional mapping: west->east maps to 0..W-1, north->south maps to 0..H-1
+        x_ratio = (lon - lon_min) / lon_span
+        y_ratio = (lat_max - lat) / lat_span
+
+        px = int(round(x_ratio * (self.input_width - 1)))
+        py = int(round(y_ratio * (self.input_height - 1)))
+
+        # Clamp to image bounds
         px = max(0, min(px, self.input_width - 1))
         py = max(0, min(py, self.input_height - 1))
-        
+
         return px, py
     
     def __len__(self) -> int:
