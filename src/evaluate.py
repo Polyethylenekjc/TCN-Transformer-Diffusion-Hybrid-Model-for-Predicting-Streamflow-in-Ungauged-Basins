@@ -6,11 +6,84 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple
 import logging
+from scipy import stats
 
 from src.model import StreamflowPredictionModel
 from src.dataset import StreamflowDataset
 from src.loss import calculate_metrics
 from src.utils.config_loader import ConfigLoader
+
+
+def calculate_ssim(pred: np.ndarray, target: np.ndarray, data_range: float = None) -> float:
+    """
+    Calculate SSIM (Structural Similarity Index) between two images.
+    
+    Args:
+        pred: Predicted image array
+        target: Target image array
+        data_range: Data range (max - min), if None will be calculated
+        
+    Returns:
+        SSIM value between 0 and 1
+    """
+    from scipy.ndimage import uniform_filter, correlate
+    
+    if data_range is None:
+        data_range = max(target.max() - target.min(), pred.max() - pred.min())
+    
+    if data_range == 0:
+        return 1.0 if np.allclose(pred, target) else 0.0
+    
+    # Constants for stability
+    K1 = 0.01
+    K2 = 0.03
+    C1 = (K1 * data_range) ** 2
+    C2 = (K2 * data_range) ** 2
+    
+    # Local means
+    mu1 = uniform_filter(pred, size=11)
+    mu2 = uniform_filter(target, size=11)
+    
+    # Local variances and covariance
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = uniform_filter(pred ** 2, size=11) - mu1_sq
+    sigma2_sq = uniform_filter(target ** 2, size=11) - mu2_sq
+    sigma12 = uniform_filter(pred * target, size=11) - mu1_mu2
+    
+    # SSIM formula
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    
+    return float(np.mean(ssim_map))
+
+
+def calculate_psnr(pred: np.ndarray, target: np.ndarray, data_range: float = None) -> float:
+    """
+    Calculate PSNR (Peak Signal-to-Noise Ratio).
+    
+    Args:
+        pred: Predicted image array
+        target: Target image array
+        data_range: Data range (max - min), if None will be calculated
+        
+    Returns:
+        PSNR value in dB
+    """
+    if data_range is None:
+        data_range = max(target.max() - target.min(), pred.max() - pred.min())
+    
+    if data_range == 0:
+        return float('inf') if np.allclose(pred, target) else 0.0
+    
+    mse = np.mean((pred - target) ** 2)
+    
+    if mse == 0:
+        return float('inf')
+    
+    return float(20 * np.log10(data_range / np.sqrt(mse)))
 
 
 class Evaluator:
@@ -97,9 +170,10 @@ class Evaluator:
         sum_abs_error = 0.0
         total_pixels = 0
         
-        # Store per-sample R2 and NSE
-        per_sample_r2 = []
-        per_sample_nse = []
+        # Image quality metrics
+        ssim_scores = []
+        psnr_scores = []
+        corr_scores = []
         
         station_results = []
         
@@ -132,16 +206,24 @@ class Evaluator:
             sum_abs_error += np.abs(pred_np - target_np).sum()
             total_pixels += pred_np.size
             
-            # Calculate per-sample R2 and NSE
-            mean_target = target_np.mean()
-            ss_res = ((pred_np - target_np) ** 2).sum()
-            ss_tot = ((target_np - mean_target) ** 2).sum()
+            # Calculate image quality metrics for this sample
+            pred_2d = prediction[0, 0].numpy()
+            target_2d = target[0, 0].numpy()
             
-            if ss_tot > 1e-10:
-                sample_r2 = 1 - (ss_res / ss_tot)
-                sample_nse = 1 - (ss_res / ss_tot)
-                per_sample_r2.append(sample_r2)
-                per_sample_nse.append(sample_nse)
+            # SSIM
+            ssim = calculate_ssim(pred_2d, target_2d)
+            ssim_scores.append(ssim)
+            
+            # PSNR
+            psnr = calculate_psnr(pred_2d, target_2d)
+            if not np.isinf(psnr):
+                psnr_scores.append(psnr)
+            
+            # Correlation
+            if pred_np.std() > 1e-10 and target_np.std() > 1e-10:
+                corr = np.corrcoef(pred_np, target_np)[0, 1]
+                if not np.isnan(corr):
+                    corr_scores.append(corr)
             
             # Save prediction image
             pred_image = prediction[0, 0].numpy()
@@ -182,15 +264,17 @@ class Evaluator:
         rmse = np.sqrt(sum_squared_error / total_pixels)
         mae = sum_abs_error / total_pixels
         
-        # Average R2 and NSE across all samples
-        r2 = np.mean(per_sample_r2) if per_sample_r2 else 0.0
-        nse = np.mean(per_sample_nse) if per_sample_nse else 0.0
+        # Image quality metrics (average across samples)
+        ssim = np.mean(ssim_scores) if ssim_scores else 0.0
+        psnr = np.mean(psnr_scores) if psnr_scores else 0.0
+        corr = np.mean(corr_scores) if corr_scores else 0.0
         
         metrics = {
             'RMSE': float(rmse),
             'MAE': float(mae),
-            'R2': float(r2),
-            'NSE': float(nse)
+            'SSIM': float(ssim),
+            'PSNR': float(psnr),
+            'Correlation': float(corr)
         }
         
         self.logger.info(f"Image-level metrics:")

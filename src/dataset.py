@@ -39,6 +39,7 @@ class StreamflowDataset(Dataset):
         self.upscale_factor = config.get('data', {}).get('upscale_factor', 2)
         self.region = config.get('data', {}).get('region', [100, 110, 25, 35])
         self.resolution = config.get('data', {}).get('resolution', 0.05)
+        self.flow_threshold = config.get('data', {}).get('flow_threshold', 0.01)  # Threshold to zero out small flow values
         # Desired input image size, can be single int or [H, W]
         img_size_cfg = config.get('data', {}).get('image_size', [128, 128])
         if isinstance(img_size_cfg, int):
@@ -300,8 +301,13 @@ class StreamflowDataset(Dataset):
                         mode='nearest'
                     ).squeeze(0)
                 img_t = img_t * mask_t  # broadcast (C,H,W) * (1,H,W)
+            
+            # Apply flow threshold to first channel (runoff/flow)
+            img_np = img_t.numpy()
+            if img_np.shape[0] > 0:  # If there's at least one channel
+                img_np[0][np.abs(img_np[0]) < self.flow_threshold] = 0.0
 
-            input_images.append(img_t.numpy())
+            input_images.append(img_np)
         
         # Stack: (T, C, H, W)
         input_images = np.stack(input_images, axis=0)
@@ -336,6 +342,9 @@ class StreamflowDataset(Dataset):
             out_t = out_t * mask_t
 
         output_flow = out_t.numpy()
+        
+        # Apply flow threshold to output
+        output_flow[np.abs(output_flow) < self.flow_threshold] = 0.0
         
         # Normalize
         if self.normalize:

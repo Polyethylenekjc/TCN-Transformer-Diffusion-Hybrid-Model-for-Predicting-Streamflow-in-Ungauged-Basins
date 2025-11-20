@@ -7,25 +7,26 @@ from typing import Dict, List, Tuple, Optional
 
 
 class ImageLoss(nn.Module):
-    """Pixel-wise image loss for flow prediction."""
+    """Pixel-wise image loss for flow prediction with optional weighting for non-zero regions."""
     
-    def __init__(self, metric: str = 'MSE', upscale_factor: int = 2):
+    def __init__(self, metric: str = 'MSE', upscale_factor: int = 2, 
+                 nonzero_weight: float = 10.0, zero_threshold: float = 1e-6):
         """
         Initialize image loss.
         
         Args:
             metric: Loss metric ('MSE' or 'MAE')
             upscale_factor: Upscaling factor for target images
+            nonzero_weight: Weight multiplier for non-zero (river) pixels
+            zero_threshold: Threshold below which a pixel is considered zero
         """
         super().__init__()
         self.metric = metric.upper()
         self.upscale_factor = upscale_factor
+        self.nonzero_weight = nonzero_weight
+        self.zero_threshold = zero_threshold
         
-        if self.metric == 'MSE':
-            self.loss_fn = nn.MSELoss()
-        elif self.metric == 'MAE':
-            self.loss_fn = nn.L1Loss()
-        else:
+        if self.metric not in ['MSE', 'MAE']:
             raise ValueError(f"Unknown metric: {metric}")
     
     def forward(
@@ -34,7 +35,7 @@ class ImageLoss(nn.Module):
         targets: torch.Tensor
     ) -> torch.Tensor:
         """
-        Calculate image loss.
+        Calculate weighted image loss.
         
         Args:
             predictions: Predicted flow map (B, 1, H, W)
@@ -52,7 +53,21 @@ class ImageLoss(nn.Module):
                 align_corners=False
             )
         
-        return self.loss_fn(predictions, targets)
+        # Create weight map: higher weight for non-zero (river) pixels
+        nonzero_mask = (torch.abs(targets) > self.zero_threshold).float()
+        weights = torch.ones_like(targets)
+        weights = weights + (self.nonzero_weight - 1.0) * nonzero_mask
+        
+        # Calculate element-wise loss
+        if self.metric == 'MSE':
+            pixel_loss = (predictions - targets) ** 2
+        else:  # MAE
+            pixel_loss = torch.abs(predictions - targets)
+        
+        # Apply weights and compute mean
+        weighted_loss = (pixel_loss * weights).sum() / weights.sum()
+        
+        return weighted_loss
 
 
 class StationLoss(nn.Module):
@@ -167,7 +182,9 @@ class CombinedLoss(nn.Module):
         # Loss functions
         self.image_loss = ImageLoss(
             metric=loss_cfg.get('metric', 'MSE'),
-            upscale_factor=upscale_factor
+            upscale_factor=upscale_factor,
+            nonzero_weight=float(loss_cfg.get('nonzero_weight', 10.0)),
+            zero_threshold=float(loss_cfg.get('zero_threshold', 1e-6))
         )
         
         station_cfg = config.get('stations', {})
