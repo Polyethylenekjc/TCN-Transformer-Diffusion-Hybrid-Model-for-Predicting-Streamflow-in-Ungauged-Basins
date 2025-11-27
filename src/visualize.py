@@ -17,8 +17,7 @@ def load_config(config_path: str) -> Dict:
 def visualize_prediction(
     pred_path: str,
     target_path: str,
-    output_path: str,
-    threshold: float = 0.05
+    output_path: str
 ):
     """
     Visualize prediction vs target.
@@ -27,16 +26,11 @@ def visualize_prediction(
         pred_path: Path to prediction .npy file
         target_path: Path to target .npy file
         output_path: Path to save visualization
-        threshold: Threshold for post-processing visualization
     """
     pred = np.load(pred_path)
     target = np.load(target_path)
     
-    # Apply threshold for visualization
-    pred_proc = pred.copy()
-    pred_proc[pred_proc < threshold] = 0
-    
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
     
     # Target
     im0 = axes[0].imshow(target, cmap='Blues')
@@ -47,11 +41,6 @@ def visualize_prediction(
     im1 = axes[1].imshow(pred, cmap='Blues')
     axes[1].set_title('Raw Prediction')
     plt.colorbar(im1, ax=axes[1])
-    
-    # Post-processed Prediction
-    im2 = axes[2].imshow(pred_proc, cmap='Blues')
-    axes[2].set_title(f'Post-processed (Thresh={threshold})')
-    plt.colorbar(im2, ax=axes[2])
     
     plt.tight_layout()
     plt.savefig(output_path)
@@ -124,7 +113,6 @@ def main():
     parser = argparse.ArgumentParser(description='Visualize model predictions')
     parser.add_argument('--config', type=str, default='./data/config.yaml', help='Path to config file')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory (overrides config)')
-    parser.add_argument('--threshold', type=float, default=0.05, help='Visualization threshold')
     args = parser.parse_args()
     
     config = load_config(args.config)
@@ -156,8 +144,7 @@ def main():
             visualize_prediction(
                 str(pred_file),
                 str(target_file),
-                str(output_path),
-                threshold=args.threshold
+                str(output_path)
             )
             print(f"Saved visualization to {output_path}")
     

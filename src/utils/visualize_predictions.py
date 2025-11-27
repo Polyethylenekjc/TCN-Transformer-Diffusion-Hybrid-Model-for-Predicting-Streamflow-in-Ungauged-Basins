@@ -10,19 +10,20 @@ Usage:
 
 import sys
 from pathlib import Path
+import torch
 
 # Add project root to the Python path
-# This allows running the script directly, e.g., for interactive development
-# or from a different working directory.
-project_root = Path(__file__).resolve().parents[2]
-if str(project_root) not in sys.path:
-    sys.path.append(str(project_root))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 import random
 from typing import List, Tuple
+
+from src.model import StreamflowPredictionModel
+from src.dataset import StreamflowDataset
+from src.utils.config_loader import ConfigLoader
 
 
 def load_image_pair(pred_file: Path, target_dir: Path = None) -> Tuple[np.ndarray, np.ndarray, str]:
@@ -108,11 +109,11 @@ def create_comparison_plot(
                 mean = norm_stats['mean']
                 std = norm_stats['std']
                 
-                # If stats are per-channel, but image is single channel, use first value
-                if isinstance(mean, np.ndarray) and pred.ndim == 2:
+                # Handle per-channel stats (assuming first channel is flow)
+                if isinstance(mean, (np.ndarray, list)) and len(mean) > 0:
                     mean = mean[0]
                     std = std[0]
-
+                
                 pred_denorm = pred * std + mean
                 target_denorm = target * std + mean
             else:
@@ -124,6 +125,16 @@ def create_comparison_plot(
 
         # Calculate error on denormalized data
         error = np.abs(pred_denorm - target_denorm)
+        
+        # Print stats for debugging
+        print(f"\nSample {date}:")
+        if denormalize and norm_stats:
+             print(f"  Denormalization Active. Stats: Mean={norm_stats.get('mean')}, Std={norm_stats.get('std')}")
+        else:
+             print(f"  Denormalization INACTIVE (showing normalized values)")
+
+        print(f"  Target range: [{target_denorm.min():.4f}, {target_denorm.max():.4f}], Mean: {target_denorm.mean():.4f}, Std: {target_denorm.std():.4f}")
+        print(f"  Pred range:   [{pred_denorm.min():.4f}, {pred_denorm.max():.4f}], Mean: {pred_denorm.mean():.4f}, Std: {pred_denorm.std():.4f}")
         
         # Determine common color scale for pred and target
         vmin = min(pred_denorm.min(), target_denorm.min())
@@ -268,7 +279,7 @@ def main():
         '--model',
         type=str,
         default=None,
-        help='Path to model file (unused, for compatibility)'
+        help='Path to model file (if provided, will run inference instead of loading predictions)'
     )
     
     args = parser.parse_args()
@@ -276,22 +287,54 @@ def main():
     # Set random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     
-    # Load config and compute stats if denormalization is requested
+    # Load config
+    try:
+        config = ConfigLoader.load_config(args.config)
+    except Exception as e:
+        print(f"Warning: Failed to load config: {e}")
+        config = {}
+
+    # Determine image directory
+    if args.image_dir:
+        image_dir = Path(args.image_dir)
+    elif 'data' in config and 'image_dir' in config['data']:
+        image_dir = Path(config['data']['image_dir'])
+    else:
+        # Try to infer from common locations
+        possible_dirs = [
+            Path('./data/images'),
+            Path('/mnt/d/store/TTF/images'),
+        ]
+        image_dir = None
+        for pdir in possible_dirs:
+            if pdir.exists():
+                image_dir = pdir
+                break
+    
+    if image_dir is None:
+        print("Error: Could not find image directory.")
+        print("Please specify it with --image-dir or in config file")
+        return
+
+    print(f"Using image directory: {image_dir}")
+
+    # Compute stats if denormalization is requested
     norm_stats = {}
     if args.denormalize:
         try:
-            from src.utils.config_loader import ConfigLoader
-            from src.dataset import StreamflowDataset
-            
-            config = ConfigLoader.load_config(args.config)
             # Initialize dataset to compute stats
-            # We only need the stats, so we can use a dummy dataset or just initialize it
-            # Note: This might take a moment as it computes stats over the dataset
             print("Computing dataset statistics for denormalization...")
+            # We need to make sure we have station_dir if we initialize dataset
+            station_dir = config['data'].get('station_dir')
+            if not station_dir:
+                 # Try to guess or just pass None if dataset allows (it might fail)
+                 station_dir = Path('./data/stations')
+            
             dataset = StreamflowDataset(
-                image_dir=config['data']['image_dir'],
-                station_dir=config['data']['station_dir'],
+                image_dir=image_dir,
+                station_dir=station_dir,
                 config=config,
                 normalize=True
             )
@@ -314,75 +357,129 @@ def main():
                      print(f"Loaded Z-score stats: mean={norm_stats['mean']:.4f}, std={norm_stats['std']:.4f}")
                 
         except Exception as e:
-            print(f"Warning: Failed to load config or compute stats: {e}")
+            print(f"Warning: Failed to compute stats: {e}")
             print("Proceeding without denormalization.")
             args.denormalize = False
     
-    # Paths
     output_dir = Path(args.output_dir)
-    pred_dir = output_dir / 'predictions'
-    
-    if not pred_dir.exists():
-        print(f"Error: Predictions directory not found at {pred_dir}")
-        print("Please run evaluation first to generate predictions.")
-        return
-    
-    # Find target image directory
-    if args.image_dir:
-        target_dir = Path(args.image_dir)
-    else:
-        # Try to infer from common locations
-        possible_dirs = [
-            Path('./data/images'),
-            Path('/mnt/d/store/TTF/images'),
-        ]
-        target_dir = None
-        for pdir in possible_dirs:
-            if pdir.exists():
-                target_dir = pdir
-                break
-        
-        if target_dir is None:
-            print("Error: Could not find target image directory.")
-            print("Please specify it with --image-dir")
-            return
-    
-    print(f"Using target directory: {target_dir}")
-    print(f"Using prediction directory: {pred_dir}")
-    
-    # Get prediction files
-    if args.date:
-        pred_files = list(pred_dir.glob(f'pred_{args.date}.npy'))
-        if not pred_files:
-            print(f"Error: No prediction found for date {args.date}")
-            return
-        print(f"Visualizing specific date: {args.date}")
-    else:
-        pred_files = list(pred_dir.glob('pred_*.npy'))
-        if len(pred_files) == 0:
-            print(f"Error: No prediction files found in {pred_dir}")
-            return
-        print(f"Found {len(pred_files)} prediction files")
-    
-    # Sample files
-    if args.date:
-        sampled_files = pred_files
-    else:
-        num_samples = min(args.num_samples, len(pred_files))
-        sampled_files = random.sample(pred_files, num_samples)
-    
-    # Load samples
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     samples = []
-    for pred_file in sampled_files:
-        try:
-            pred, target, date = load_image_pair(pred_file, target_dir)
-            samples.append((pred, target, date))
-            print(f"Loaded sample: {date}")
-        except Exception as e:
-            print(f"Warning: Failed to load {pred_file.name}: {e}")
+
+    if args.model:
+        # Run inference using the model
+        print(f"Loading model from {args.model}...")
+        device = torch.device(config.get('train', {}).get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        
+        model = StreamflowPredictionModel(config)
+        model.load_state_dict(torch.load(args.model, map_location=device))
+        model.to(device)
+        model.eval()
+        
+        # Initialize dataset for inference
+        # We reuse the dataset if it was already created for stats, otherwise create it
+        if 'dataset' not in locals():
+            station_dir = config['data'].get('station_dir')
+            dataset = StreamflowDataset(
+                image_dir=image_dir,
+                station_dir=station_dir,
+                config=config,
+                normalize=True
+            )
+        
+        print(f"Dataset size: {len(dataset)}")
+        
+        # Select indices
+        indices = []
+        if args.date:
+            # Find index for specific date
+            target_date = args.date
+            found = False
+            for idx in range(len(dataset)):
+                output_idx = dataset.samples[idx]['output_index']
+                file_path = dataset.image_files[output_idx]
+                # Assuming filename format YYYYMMDD.npy or similar
+                # Check if date string is in filename
+                if target_date in file_path.stem:
+                    indices.append(idx)
+                    found = True
+                    break
+            if not found:
+                print(f"Error: Date {args.date} not found in dataset")
+                return
+        else:
+            # Random samples
+            num_samples = min(args.num_samples, len(dataset))
+            indices = random.sample(range(len(dataset)), num_samples)
+            
+        print(f"Running inference on {len(indices)} samples...")
+        
+        for idx in indices:
+            sample = dataset[idx]
+            
+            # Prepare input
+            images = sample['images'].unsqueeze(0).to(device) # (1, T, C, H, W)
+            
+            # Run model
+            with torch.no_grad():
+                prediction = model(images)
+            
+            # Get prediction as numpy
+            pred_np = prediction.cpu().numpy()[0, 0] # (H, W)
+            
+            # Get target
+            target_np = sample['output_image'].numpy()[0] # (H, W)
+            
+            # Get date
+            output_idx = dataset.samples[idx]['output_index']
+            date = Path(dataset.image_files[output_idx]).stem
+            
+            samples.append((pred_np, target_np, date))
+            print(f"Processed sample: {date}")
+
+    else:
+        # Load existing predictions from disk
+        pred_dir = output_dir / 'predictions'
+        
+        if not pred_dir.exists():
+            print(f"Error: Predictions directory not found at {pred_dir}")
+            print("Please run evaluation first to generate predictions or use --model to run inference.")
+            return
+        
+        print(f"Using prediction directory: {pred_dir}")
+        
+        # Get prediction files
+        if args.date:
+            pred_files = list(pred_dir.glob(f'pred_{args.date}.npy'))
+            if not pred_files:
+                print(f"Error: No prediction found for date {args.date}")
+                return
+            print(f"Visualizing specific date: {args.date}")
+        else:
+            pred_files = list(pred_dir.glob('pred_*.npy'))
+            if len(pred_files) == 0:
+                print(f"Error: No prediction files found in {pred_dir}")
+                return
+            print(f"Found {len(pred_files)} prediction files")
+        
+        # Sample files
+        if args.date:
+            sampled_files = pred_files
+        else:
+            num_samples = min(args.num_samples, len(pred_files))
+            sampled_files = random.sample(pred_files, num_samples)
+        
+        # Load samples
+        for pred_file in sampled_files:
+            try:
+                pred, target, date = load_image_pair(pred_file, image_dir)
+                samples.append((pred, target, date))
+                print(f"Loaded sample: {date}")
+            except Exception as e:
+                print(f"Warning: Failed to load {pred_file.name}: {e}")
     
     if len(samples) == 0:
-        print("Error: No valid samples could be loaded")
+        print("Error: No valid samples could be loaded/generated")
         return
     
     print(f"\nCreating visualizations for {len(samples)} samples...")
