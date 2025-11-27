@@ -8,9 +8,18 @@ Usage:
     python -m src.utils.visualize_predictions --output-dir ./output --num-samples 6
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to the Python path
+# This allows running the script directly, e.g., for interactive development
+# or from a different working directory.
+project_root = Path(__file__).resolve().parents[2]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 import argparse
 import random
 from typing import List, Tuple
@@ -96,8 +105,16 @@ def create_comparison_plot(
                 target_denorm = target * (norm_stats['max'] - norm_stats['min']) + norm_stats['min']
             elif 'mean' in norm_stats and 'std' in norm_stats:
                 # Z-score denormalization
-                pred_denorm = pred * norm_stats['std'] + norm_stats['mean']
-                target_denorm = target * norm_stats['std'] + norm_stats['mean']
+                mean = norm_stats['mean']
+                std = norm_stats['std']
+                
+                # If stats are per-channel, but image is single channel, use first value
+                if isinstance(mean, np.ndarray) and pred.ndim == 2:
+                    mean = mean[0]
+                    std = std[0]
+
+                pred_denorm = pred * std + mean
+                target_denorm = target * std + mean
             else:
                 pred_denorm = pred
                 target_denorm = target

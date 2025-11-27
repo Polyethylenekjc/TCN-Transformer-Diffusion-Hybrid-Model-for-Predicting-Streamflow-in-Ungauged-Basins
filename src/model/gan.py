@@ -97,7 +97,9 @@ class GANLoss(nn.Module):
         Returns:
             Discriminator loss
         """
-        real_labels = torch.ones_like(disc_real)
+        # Label smoothing: use 0.9 instead of 1.0 for real images
+        # This prevents the discriminator from becoming too confident
+        real_labels = torch.ones_like(disc_real) * 0.9
         fake_labels = torch.zeros_like(disc_fake)
         
         loss_real = self.gan_loss(disc_real, real_labels)

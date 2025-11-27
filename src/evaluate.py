@@ -289,6 +289,15 @@ class Evaluator:
         # Save station results
         if station_results:
             df = pd.DataFrame(station_results)
+            
+            # Denormalize if needed
+            if self.config.get('data', {}).get('normalize', True):
+                # Assuming z-score normalization was used
+                # We need mean and std from dataset if available, or re-calculate
+                # For now, we'll just save the normalized values as is, 
+                # but we'll add a column for denormalized values if we can access the stats
+                pass
+
             csv_path = output_path / 'stations_eval.csv'
             df.to_csv(csv_path, index=False)
             
@@ -306,6 +315,18 @@ class Evaluator:
                 self.logger.info(f"  {metric_name}: {value:.4f}")
             
             metrics['station_metrics'] = station_metrics
+            
+            # Save metrics to CSV for easy plotting
+            metrics_df = pd.DataFrame([metrics])
+            # Flatten nested dictionary
+            if 'station_metrics' in metrics:
+                for k, v in metrics['station_metrics'].items():
+                    metrics_df[f'station_{k}'] = v
+                metrics_df = metrics_df.drop('station_metrics', axis=1)
+            
+            metrics_csv_path = output_path / 'evaluation_metrics.csv'
+            metrics_df.to_csv(metrics_csv_path, index=False)
+            self.logger.info(f"Metrics saved to {metrics_csv_path}")
         
         return metrics
 

@@ -18,6 +18,7 @@ except Exception:
     RICH_AVAILABLE = False
 
 from src.model import StreamflowPredictionModel, MultiTaskStreamflowModel
+from src.model.gan import PatchDiscriminator, GANLoss
 from src.dataset import StreamflowDataset, DataLoader
 from src.loss import CombinedLoss, calculate_metrics
 from src.utils.config_loader import ConfigLoader
@@ -53,8 +54,35 @@ class Trainer:
         self.loss_fn = CombinedLoss(config)
         self.loss_fn.to(self.device)
         
-        # Optimizer
         lr = config.get('train', {}).get('lr', 1e-4)
+        
+        # GAN setup
+        self.use_gan = config.get('model', {}).get('use_gan', False)
+        if self.use_gan:
+            self.logger.info("Initializing GAN components...")
+            # Discriminator
+            self.discriminator = PatchDiscriminator(
+                input_channels=1,  # Output is 1 channel (flow)
+                hidden_channels=64
+            ).to(self.device)
+            
+            # GAN Loss
+            self.gan_weight = config.get('model', {}).get('gan_weight', 0.1)
+            self.gan_loss_fn = GANLoss(
+                lambda_gan=self.gan_weight,
+                lambda_pixel=1.0  # Pixel loss is handled by CombinedLoss
+            ).to(self.device)
+            
+            # Discriminator Optimizer
+            # Use lower learning rate for discriminator to prevent it from overpowering generator
+            self.optimizer_D = torch.optim.Adam(
+                self.discriminator.parameters(),
+                lr=lr * 0.2,  # 20% of generator LR
+                betas=(0.5, 0.999)  # Standard GAN betas
+            )
+            self.logger.info(f"GAN enabled with weight {self.gan_weight}")
+        
+        # Optimizer
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=lr
@@ -66,6 +94,9 @@ class Trainer:
         
         # Gradient accumulation
         self.grad_accum_steps = config.get('system', {}).get('grad_accum_steps', 1)
+        
+        # Discriminator update interval (Train D every N steps)
+        self.d_update_interval = 3  # Update D only once every 3 batches
         
         # Training tracking
         self.epoch = 0
@@ -172,16 +203,44 @@ class Trainer:
                     station_runoffs
                 )
                 
+                loss_G = loss_dict['total']
+                
+                if self.use_gan:
+                    # Generator Adversarial Loss
+                    # We want discriminator to classify generated images as real
+                    pred_fake = self.discriminator(predictions)
+                    loss_G_gan = self.gan_loss_fn.gan_loss(pred_fake, torch.ones_like(pred_fake))
+                    
+                    # Combine losses
+                    loss_G = loss_G + self.gan_weight * loss_G_gan
+                    loss_dict['gan_g'] = loss_G_gan
+                    loss_dict['total'] = loss_G  # Update total for logging
+
                 if torch.isnan(loss_dict['total']).any() or torch.isinf(loss_dict['total']).any():
                     self.logger.warning("NaN or Inf found in loss!")
 
-                loss = loss_dict['total'] / self.grad_accum_steps
-            
-            # Backward pass
+            # Backward Generator
             if self.use_amp:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss_G / self.grad_accum_steps).backward()
             else:
-                loss.backward()
+                (loss_G / self.grad_accum_steps).backward()
+            
+            # Discriminator Step
+            if self.use_gan and (batch_idx % self.d_update_interval == 0):
+                with amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    # Real loss
+                    pred_real = self.discriminator(output_image)
+                    # Fake loss (detach to avoid backprop to generator)
+                    pred_fake_d = self.discriminator(predictions.detach())
+                    
+                    loss_D = self.gan_loss_fn.discriminator_loss(pred_real, pred_fake_d)
+                    loss_dict['gan_d'] = loss_D
+                
+                # Backward Discriminator
+                if self.use_amp:
+                    self.scaler.scale(loss_D / self.grad_accum_steps).backward()
+                else:
+                    (loss_D / self.grad_accum_steps).backward()
             
             # Accumulate metrics
             total_loss += loss_dict['total'].item()
@@ -193,16 +252,22 @@ class Trainer:
             if (batch_idx + 1) % self.grad_accum_steps == 0:
                 if self.use_amp:
                     self.scaler.step(self.optimizer)
+                    # Only step D optimizer if we computed gradients for it
+                    if self.use_gan and (batch_idx % self.d_update_interval == 0):
+                        self.scaler.step(self.optimizer_D)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
+                    if self.use_gan and (batch_idx % self.d_update_interval == 0):
+                        self.optimizer_D.step()
                 
                 self.optimizer.zero_grad()
+                if self.use_gan:
+                    self.optimizer_D.zero_grad()
                 
                 # Log GPU memory
                 if (batch_idx + 1) % (self.log_interval * self.grad_accum_steps) == 0:
                     self._log_gpu_memory()
-                    # (Removed LR/GradNorm logging as requested)
             
             # Periodic logging
             if (batch_idx + 1) % self.log_interval == 0:
@@ -210,10 +275,14 @@ class Trainer:
                 avg_img = total_img_loss / num_batches
                 avg_stn = total_stn_loss / num_batches
                 
-                self.logger.info(
+                log_msg = (
                     f"Epoch {self.epoch} Batch {batch_idx + 1}: "
                     f"Loss={avg_loss:.6f}, Img={avg_img:.6f}, Stn={avg_stn:.6f}"
                 )
+                if self.use_gan and 'gan_d' in loss_dict:
+                    log_msg += f", D_Loss={loss_dict['gan_d'].item():.6f}"
+                
+                self.logger.info(log_msg)
             # If an external progress/task were provided in self._active_progress, update it
             active = getattr(self, '_active_progress', None)
             if active is not None:
@@ -257,6 +326,10 @@ class Trainer:
                 
                 # Forward pass
                 predictions = self.model(images)
+                
+                # Post-processing for validation metrics (optional but recommended for consistency)
+                # We don't apply this for loss calculation, only for metrics if needed
+                # But here we keep raw predictions for loss calculation
                 
                 # Calculate loss
                 loss_dict = self.loss_fn(
@@ -377,6 +450,14 @@ class Trainer:
                 ckpt_path = output_dir / f'checkpoint_epoch_{epoch}.pt'
                 torch.save(self.model.state_dict(), ckpt_path)
                 self.logger.info(f"Checkpoint saved to {ckpt_path}")
+            
+            # Save GAN checkpoints every epoch
+            if self.use_gan:
+                gan_dir = output_dir / 'gan'
+                gan_dir.mkdir(parents=True, exist_ok=True)
+                gan_ckpt_path = gan_dir / f'gan_epoch_{epoch}.pt'
+                torch.save(self.model.state_dict(), gan_ckpt_path)
+                self.logger.info(f"GAN Checkpoint saved to {gan_ckpt_path}")
             
             self._log_gpu_memory()
         
